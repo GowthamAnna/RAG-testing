@@ -1,60 +1,184 @@
-# Den_review.py — hardened & updated
-# ------------------------------------------------------------
-# - Unpacks (rows, meta) from format_responses_with_meta correctly
-# - Never mixes list and dict when building responses
-# - Defensive token accounting and section review handling
-# - Robust Excel export using a template (keeps styles if present)
-# - Always returns a dict: {"output_excel": BytesIO, "tokens": {...}, "pointout_count": int}
-# ------------------------------------------------------------
+# Den_review.py — 5KB byte-based chunking + 7-column DF + readable Excel
+# Python 3.12 compatible
 
 from __future__ import annotations
 
 import io
 import re
 from copy import copy
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Alignment
 from dotenv import load_dotenv
 
-# ---- LLMClient import: try common local layouts gracefully ----
+# ---- Adjust this import to YOUR project layout ----
 try:
-    # e.g., project/clients/llm_client.py -> class LLMClient
-    from clients.llm_client import LLMClient  # type: ignore
+    from clients.llm_client import LLMClient  # common layout
 except Exception:
     try:
-        # e.g., project/clients/llm.py -> class LLMClient
-        from clients.llm import LLMClient  # type: ignore
-    except Exception:
-        try:
-            # legacy path some codebases use
-            from mdr.client.llm import LLMClient  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "Could not import LLMClient. Adjust the import path at the top of Den_review.py."
-            ) from e
+        from clients.llm import LLMClient
+    except Exception as e:
+        raise ImportError("Fix LLMClient import at top of Den_review.py") from e
 
-# These modules are assumed to exist in your project
-# - format_document_data: read_until_title, split_text_by_size, Section_chunks
-# - format_dataframe: custom_dataframe, filter_dataframe
+# These are your helpers/modules
 import format_document_data
 import format_dataframe
 
 
+# ----------------------- Chunking (bytes, ~5KB) -----------------------
+
+def _bytes_len(s: str) -> int:
+    return len(s.encode("utf-8", errors="ignore"))
+
+def smart_chunk_bytes(text: str, max_kb: int = 5, soft_min_kb: int = 4) -> List[str]:
+    """
+    Chunk a long string into ~max_kb (UTF-8 bytes) pieces, preferring paragraph boundaries,
+    with a sentence/punctuation-aware fallback if a single paragraph is huge.
+
+    - max_kb: hard cap per chunk in kilobytes
+    - soft_min_kb: if a unit is very long, try to cut after this many KB at a natural boundary
+    """
+    if not text:
+        return [""]
+
+    max_bytes = max_kb * 1024
+    soft_min_bytes = soft_min_kb * 1024
+
+    # If text already small, single chunk
+    if _bytes_len(text) <= max_bytes:
+        return [text]
+
+    # Split paragraphs but keep separators so structure survives
+    parts = re.split(r"(\n\s*\n)", text)  # keeps the double-newline separators
+    chunks: List[str] = []
+    buf: List[str] = []
+    buf_bytes = 0
+
+    def flush():
+        nonlocal buf, buf_bytes, chunks
+        if buf:
+            chunk = "".join(buf).strip()
+            if chunk:
+                chunks.append(chunk)
+            buf, buf_bytes = [], 0
+
+    for part in parts:
+        b_len = _bytes_len(part)
+        # If it fits, accumulate
+        if buf_bytes + b_len <= max_bytes:
+            buf.append(part)
+            buf_bytes += b_len
+            continue
+
+        # If the part itself is massive, split it with sentence-aware fallback
+        if b_len > max_bytes:
+            # flush current buffer first
+            flush()
+            start = 0
+            # Work on the raw string by indexes, but measure slices in bytes
+            while start < len(part):
+                # optimistic end bound by characters; we adjust by bytes
+                # Expand window to near max_bytes (by bytes)
+                end_char = min(len(part), start + max_bytes)  # rough char bound
+                # tighten end_char so bytes <= max_bytes
+                # (binary-shrink to avoid quadratic worst-case)
+                lo, hi = start, end_char
+                best = start
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if _bytes_len(part[start:mid]) <= max_bytes:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                end_char = best
+
+                # If we have room to look for a natural boundary and the slice is reasonably large
+                slice_str = part[start:end_char]
+                if _bytes_len(slice_str) >= soft_min_bytes:
+                    # try to land on punctuation or whitespace near the tail
+                    # prioritize hard breaks/new paragraphs, then sentence-ish, then spaces
+                    tail_window = slice_str[-min(len(slice_str), 400):]  # last ~400 chars
+                    cut_rel = max(
+                        tail_window.rfind("\n\n"),
+                        tail_window.rfind("。\n"),
+                        tail_window.rfind("。」"),
+                        tail_window.rfind(". "),
+                        tail_window.rfind("。"),
+                        tail_window.rfind("、"),
+                        tail_window.rfind("，"),
+                        tail_window.rfind(", "),
+                        tail_window.rfind(" "),
+                    )
+                    if cut_rel > 10:  # avoid cutting too close to start
+                        # move end_char back to that boundary
+                        end_char = end_char - (len(tail_window) - cut_rel - 1)
+                        slice_str = part[start:end_char]
+
+                chunks.append(slice_str.strip())
+                start = end_char
+        else:
+            # Current part would overflow the buffer; flush and then add to new buffer
+            flush()
+            buf.append(part)
+            buf_bytes = b_len
+
+    flush()
+    # remove empties
+    return [c for c in chunks if c]
+
+
 # ----------------------- Utilities -----------------------
 
-def read_markdown_file(file_path: str) -> str:
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
 def sanitize_string(value: Any) -> Any:
-    """Remove control chars that break Excel cells."""
     if isinstance(value, str):
+        # Remove ASCII control chars that upset Excel cells
         return re.sub(r"[\x00-\x1F]", "", value)
     return value
+
+
+def enforce_7_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Your logs showed 8 columns including 'result'. The sheet should have 7.
+    Drop 'result' if present and log the final column list.
+    """
+    if "result" in df.columns:
+        df = df.drop(columns=["result"])
+    print(df.columns, "Number of columns in df which should be 7")
+    return df
+
+
+def apply_readability(ws: openpyxl.worksheet.worksheet.Worksheet, df: pd.DataFrame):
+    """
+    Make Excel legible:
+      - Wrap text for long text columns like 'target_chunk' and 'AI_chunk'
+      - Set column widths so the first column isn't a wall of text
+    """
+    col_widths = []
+    for cname in df.columns:
+        if cname in ("All_No", "pointout_level", "pointout_category"):
+            col_widths.append(12)
+        elif cname in ("point_why", "point_imp"):
+            col_widths.append(28)
+        elif cname in ("target_chunk", "AI_chunk"):
+            col_widths.append(60)
+        else:
+            col_widths.append(24)
+
+    for idx, width in enumerate(col_widths, start=1):
+        col_letter = openpyxl.utils.get_column_letter(idx)
+        ws.column_dimensions[col_letter].width = width
+
+    # Wrap text + align top for all data cells we just wrote (start at row 2 per writer)
+    max_row = ws.max_row
+    max_col = ws.max_column
+    for r in range(2, max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 
 def save_to_excel(
@@ -65,18 +189,17 @@ def save_to_excel(
     main_sheet_name: str = "レビュー結果",
 ) -> Tuple[io.BytesIO, int]:
     """
-    Writes df -> Excel using template_path while preserving cell styles
-    in the second row as a style source for all rows.
-    Also writes a filtered version based on specific_strings_json.
+    Writes df -> Excel using template_path while preserving cell styles from row 2
+    and making the long-text columns readable (wrapped + wider).
     Returns (excel_bytes, pointout_count_of_filtered_df)
     """
     output_excel = io.BytesIO()
     wb = openpyxl.load_workbook(template_path)
 
-    # Build filtered df via your rule set
+    # Filtered DF for the main sheet
     filtered_df = format_dataframe.filter_dataframe(df, specific_strings_json)
 
-    # Optional "before exclusion" sheet (full df)
+    # Optional "before exclusion" sheet for the raw df
     if before_sheet_name in wb.sheetnames:
         ws_before = wb[before_sheet_name]
         for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), start=2):
@@ -90,12 +213,16 @@ def save_to_excel(
     if main_sheet_name not in wb.sheetnames:
         wb.create_sheet(main_sheet_name)
     ws = wb[main_sheet_name]
+
     for r_idx, row in enumerate(dataframe_to_rows(filtered_df, index=False, header=False), start=2):
         for c_idx, value in enumerate(row, start=1):
             new_cell = ws.cell(row=r_idx, column=c_idx, value=sanitize_string(value))
             base_cell = ws.cell(row=2, column=c_idx)
             if base_cell.has_style:
                 new_cell._style = copy(base_cell._style)
+
+    # Make the main sheet readable (widths + wrap)
+    apply_readability(ws, filtered_df)
 
     pointout_count = len(filtered_df)
 
@@ -110,15 +237,15 @@ def create_AI_review(
     system_message_chat_conversation: str,
     markdown_txt: str,
     *,
-    chunk_size_kb: int = 5,
+    chunk_size_kb: int = 5,              # << byte-based target chunk size
     excel_template: str = "Den_temp.xlsx",
     specific_strings_json: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
-    Runs a two-phase review:
-      1) Pre-title text in ~chunk_size_kb chunks via LLM
-      2) Section-based review via Section_chunks()
-    Aggregates rows, numbers them, builds a DataFrame, and exports Excel.
+    Two-phase review:
+      1) Chunk the WHOLE markdown into ~chunk_size_kb (bytes) and review per chunk
+      2) Section-based review (format_document_data.Section_chunks)
+    Aggregates rows, numbers them, builds DataFrame, exports Excel.
 
     Returns:
       {
@@ -131,23 +258,16 @@ def create_AI_review(
     load_dotenv()
 
     if specific_strings_json is None:
-        # tweak this dict to your filtering rules
         specific_strings_json = {"domain_terms": ["半角カナ", "全角カナ"]}
 
-    # -------- Phase 0: prep input --------
+    # -------- Phase 0: robust byte-based chunking (~5KB) --------
     try:
-        text_before_title = format_document_data.read_until_title(markdown_txt)
+        text_chunks = smart_chunk_bytes(markdown_txt, max_kb=chunk_size_kb, soft_min_kb=max(1, chunk_size_kb - 1))
     except Exception as e:
-        print("Error in read_until_title:", e)
-        # Fallback: process entire text
-        text_before_title = markdown_txt
+        print("Error in smart_chunk_bytes; falling back to a single chunk:", e)
+        text_chunks = [markdown_txt]
 
-    try:
-        text_chunks = format_document_data.split_text_by_size(text_before_title, chunk_size_kb)
-    except Exception as e:
-        print("Error in split_text_by_size:", e)
-        # Fallback: one chunk = original text
-        text_chunks = [text_before_title]
+    print("DEBUG: len(text_chunks) =", len(text_chunks))
 
     # -------- Phase 1: per-chunk LLM review --------
     all_pre_rows: List[Dict[str, Any]] = []
@@ -163,21 +283,19 @@ def create_AI_review(
             llm = LLMClient(model="gpt-4.1", temperature=0.0)
             data = llm.generate_review(system_message_chat_conversation, text_chunk)
 
-            # IMPORTANT: unpack (rows_list, meta_dict)
+            # IMPORTANT: correctly unpack tuple (rows_list, meta_dict)
             rows, _meta = llm.format_responses_with_meta(
                 result_payload=data,
                 all_no=AllNo,
                 chapter_titles=text_chunk,
             )
 
-            # Only extend with row dicts
             if isinstance(rows, list):
                 all_pre_rows.extend(rows)
                 AllNo += len(rows)
             else:
-                print("format_responses_with_meta returned non-list rows; skipping this chunk.")
+                print("format_responses_with_meta returned non-list rows; skipping.")
 
-            # Defensive tokens accounting
             toks = data.get("tokens", {}) if isinstance(data, dict) else {}
             pre_total_tokens += int(toks.get("total_tokens", 0) or 0)
             pre_prompt_tokens += int(toks.get("prompt_tokens", 0) or 0)
@@ -186,7 +304,7 @@ def create_AI_review(
         except Exception as e:
             print("Exception in the create_AI_review loop (Den_review.py):", e)
 
-        print("x is ----------------------------------------------------------", x)
+        print("x is -------------------------------", x)
         x += 1
 
     # -------- Phase 2: section-based review --------
@@ -194,7 +312,6 @@ def create_AI_review(
         section_result = format_document_data.Section_chunks(
             markdown_txt, system_message_chat_conversation
         )
-        # Expected: {"all_responses": [row, ...], "tokens": {...}}
         if not isinstance(section_result, dict):
             raise ValueError("Section_chunks returned non-dict.")
     except Exception as e:
@@ -221,20 +338,22 @@ def create_AI_review(
             last_no += 1
             r["All_No"] = last_no
 
-    final_responses: List[Dict[str, Any]] = all_pre_rows + [r for r in section_responses if isinstance(r, dict)]
+    final_rows: List[Dict[str, Any]] = all_pre_rows + [r for r in section_responses if isinstance(r, dict)]
 
-    print(type(final_responses), "Type of final_responses:\n")
-    print("Final responses:\n", final_responses)
+    print(type(final_rows), "Type of final_responses:\n")
+    print("Final responses (first 3 rows):\n", final_rows[:3], "... total:", len(final_rows))
 
     # -------- DataFrame build (defensive) --------
     try:
-        df = format_dataframe.custom_dataframe(final_responses)
+        df = format_dataframe.custom_dataframe(final_rows)
         if not isinstance(df, pd.DataFrame):
             raise TypeError("custom_dataframe did not return a pandas DataFrame.")
     except Exception as e:
         print("Error in custom_dataframe function:", e)
-        # Fallback minimal DF
-        df = pd.DataFrame(final_responses)
+        df = pd.DataFrame(final_rows)
+
+    # Ensure exactly 7 columns for the template
+    df = enforce_7_columns(df)
 
     # -------- Excel export (defensive) --------
     try:
