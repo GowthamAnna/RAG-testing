@@ -180,52 +180,104 @@ def apply_readability(ws: openpyxl.worksheet.worksheet.Worksheet, df: pd.DataFra
             cell = ws.cell(row=r, column=c)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
+def build_export_df(final_rows):
+    # Create a DataFrame with exactly 7 columns we want to export.
+    import pandas as pd
+
+    def short_excerpt(s, limit=180):
+        if not isinstance(s, str):
+            return ""
+        s = s.strip().replace("\n", " ")
+        return s if len(s) <= limit else s[:limit] + "..."
+
+    rows = []
+    for r in final_rows:
+        if not isinstance(r, dict):
+            continue
+        check_spot = (
+            r.get("section")
+            or r.get("chapter")
+            or r.get("chapter_title")
+            or ""
+        )
+        rows.append({
+            "No": r.get("All_No", ""),
+            "チェック箇所": check_spot,
+            "指摘箇所": short_excerpt(r.get("target_chunk") or r.get("AI_chunk") or ""),
+            "指摘理由": r.get("point_why", ""),
+            "改善提案": r.get("point_imp", ""),
+            "処置難易度": r.get("pointout_level", ""),
+            "指摘分類": r.get("pointout_category", ""),
+        })
+
+    return pd.DataFrame(rows, columns=["No", "チェック箇所", "指摘箇所", "指摘理由", "改善提案", "処置難易度", "指摘分類"])
+
+def write_export_df_to_sheet(ws, export_df):
+    # Writes starting at row 2, using fixed columns:
+    #  A No | B チェック箇所 | C 指摘箇所 | D 指摘理由 | E 改善提案 | I 処置難易度 | J 指摘分類
+    from openpyxl.styles import Alignment
+    col_map = {
+        "No": 1,          # A
+        "チェック箇所": 2,  # B
+        "指摘箇所": 3,    # C
+        "指摘理由": 4,    # D
+        "改善提案": 5,    # E
+        "処置難易度": 9,  # I
+        "指摘分類": 10,   # J
+    }
+    for row_idx, (_, row) in enumerate(export_df.iterrows(), start=2):
+        for col_name, excel_col in col_map.items():
+            cell = ws.cell(row=row_idx, column=excel_col, value=row[col_name])
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
 
 def save_to_excel(
-    df: pd.DataFrame,
+    export_df,                     # NOTE: this is the 7-column df from build_export_df
     template_path: str,
-    specific_strings_json: Dict[str, Any],
+    specific_strings_json: dict,
     before_sheet_name: str = "レビュー結果_除外前",
     main_sheet_name: str = "レビュー結果",
-) -> Tuple[io.BytesIO, int]:
-    """
-    Writes df -> Excel using template_path while preserving cell styles from row 2
-    and making the long-text columns readable (wrapped + wider).
-    Returns (excel_bytes, pointout_count_of_filtered_df)
-    """
+):
+    import io, openpyxl
+    from copy import copy
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.utils import get_column_letter
+
     output_excel = io.BytesIO()
     wb = openpyxl.load_workbook(template_path)
 
-    # Filtered DF for the main sheet
-    filtered_df = format_dataframe.filter_dataframe(df, specific_strings_json)
+    # If you want to keep your existing filter step, apply it to the export df:
+    filtered_df = format_dataframe.filter_dataframe(export_df, specific_strings_json)
 
-    # Optional "before exclusion" sheet for the raw df
+    # Optional: dump the raw export df to the "除外前" sheet (columns laid out sequentially)
     if before_sheet_name in wb.sheetnames:
         ws_before = wb[before_sheet_name]
-        for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), start=2):
+        for r_idx, row in enumerate(dataframe_to_rows(export_df, index=False, header=False), start=2):
             for c_idx, value in enumerate(row, start=1):
-                new_cell = ws_before.cell(row=r_idx, column=c_idx, value=sanitize_string(value))
                 base_cell = ws_before.cell(row=2, column=c_idx)
+                new_cell = ws_before.cell(row=r_idx, column=c_idx, value=sanitize_string(value))
                 if base_cell.has_style:
                     new_cell._style = copy(base_cell._style)
 
-    # Main output sheet (filtered)
+    # Main target sheet (we write into A,B,C,D,E,I,J)
     if main_sheet_name not in wb.sheetnames:
         wb.create_sheet(main_sheet_name)
     ws = wb[main_sheet_name]
 
-    for r_idx, row in enumerate(dataframe_to_rows(filtered_df, index=False, header=False), start=2):
-        for c_idx, value in enumerate(row, start=1):
-            new_cell = ws.cell(row=r_idx, column=c_idx, value=sanitize_string(value))
-            base_cell = ws.cell(row=2, column=c_idx)
-            if base_cell.has_style:
-                new_cell._style = copy(base_cell._style)
+    # Clear previous data rows if any (keep header row 1 and styling in row 2 if you use it)
+    max_existing = ws.max_row
+    if max_existing > 2:
+        ws.delete_rows(3, max_existing - 2)
 
-    # Make the main sheet readable (widths + wrap)
-    apply_readability(ws, filtered_df)
+    # Precise placement
+    write_export_df_to_sheet(ws, filtered_df)
+
+    # Optional: set widths to make it readable
+    widths = {1: 8, 2: 24, 3: 60, 4: 36, 5: 36, 9: 14, 10: 14}
+    for col_idx, width in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     pointout_count = len(filtered_df)
-
     wb.save(output_excel)
     output_excel.seek(0)
     return output_excel, pointout_count
@@ -356,14 +408,18 @@ def create_AI_review(
     df = enforce_7_columns(df)
 
     # -------- Excel export (defensive) --------
+    # After you have final_rows
+    export_df = build_export_df(final_rows)
+
     try:
         output_excel, pointout_count = save_to_excel(
-            df=df,
+            export_df,                     # << use export_df here
             template_path=excel_template,
             specific_strings_json=specific_strings_json,
         )
     except Exception as e:
         print("Error in the save_to_excel function:", e)
+        import io
         output_excel, pointout_count = io.BytesIO(), 0
 
     print("create_AI_review function ended")
