@@ -14,21 +14,44 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Alignment
 from dotenv import load_dotenv
 
-# ---- Adjust this import to YOUR project layout ----
-try:
-    from clients.llm_client import LLMClient  # common layout
-except Exception:
-    try:
-        from clients.llm import LLMClient
-    except Exception as e:
-        raise ImportError("Fix LLMClient import at top of Den_review.py") from e
-
 # These are your helpers/modules
 import format_document_data
 import format_dataframe
+import re
+from mdr.client.llm import LLMClient
 
 
 # ----------------------- Chunking (bytes, ~5KB) -----------------------
+
+HEADER_RE = re.compile(r'^(#{1,6})\s*(.+?)\s*$', re.MULTILINE)
+
+def parse_headers(markdown_txt: str):
+    """
+    Returns list of (start_index, title) for all Markdown headers.
+    """
+    headers = []
+    for m in HEADER_RE.finditer(markdown_txt):
+        headers.append((m.start(), m.group(2)))
+    headers.sort(key=lambda x: x[0])
+    return headers
+
+def nearest_header_for(markdown_txt: str, headers, snippet: str) -> str:
+    """
+    Finds the nearest preceding header for a snippet of text.
+    """
+    if not snippet:
+        return ""
+    probe = snippet.strip().replace("\n", " ")[:60]  # short search key
+    pos = markdown_txt.find(probe)
+    if pos == -1:
+        return ""
+    chosen = ""
+    for start, title in headers:
+        if start <= pos:
+            chosen = title
+        else:
+            break
+    return chosen
 
 def _bytes_len(s: str) -> int:
     return len(s.encode("utf-8", errors="ignore"))
@@ -180,37 +203,39 @@ def apply_readability(ws: openpyxl.worksheet.worksheet.Worksheet, df: pd.DataFra
             cell = ws.cell(row=r, column=c)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
-def build_export_df(final_rows):
-    # Create a DataFrame with exactly 7 columns we want to export.
+def build_export_df(markdown_txt: str, final_rows):
+    """
+    Export 7 columns. チェック箇所 is auto-filled from nearest header in markdown_txt.
+    """
     import pandas as pd
-
-    def short_excerpt(s, limit=180):
-        if not isinstance(s, str):
-            return ""
-        s = s.strip().replace("\n", " ")
-        return s if len(s) <= limit else s[:limit] + "..."
+    headers = parse_headers(markdown_txt)
 
     rows = []
     for r in final_rows:
         if not isinstance(r, dict):
             continue
+
+        snippet = r.get("target_chunk") or r.get("AI_chunk") or ""
         check_spot = (
             r.get("section")
             or r.get("chapter")
             or r.get("chapter_title")
-            or ""
+            or nearest_header_for(markdown_txt, headers, snippet)
         )
+
         rows.append({
             "No": r.get("All_No", ""),
             "チェック箇所": check_spot,
-            "指摘箇所": short_excerpt(r.get("target_chunk") or r.get("AI_chunk") or ""),
+            "指摘箇所": snippet,
             "指摘理由": r.get("point_why", ""),
             "改善提案": r.get("point_imp", ""),
             "処置難易度": r.get("pointout_level", ""),
             "指摘分類": r.get("pointout_category", ""),
         })
 
-    return pd.DataFrame(rows, columns=["No", "チェック箇所", "指摘箇所", "指摘理由", "改善提案", "処置難易度", "指摘分類"])
+    return pd.DataFrame(rows, columns=[
+        "No", "チェック箇所", "指摘箇所", "指摘理由", "改善提案", "処置難易度", "指摘分類"
+    ])
 
 def write_export_df_to_sheet(ws, export_df):
     # Writes starting at row 2, using fixed columns:
@@ -409,7 +434,7 @@ def create_AI_review(
 
     # -------- Excel export (defensive) --------
     # After you have final_rows
-    export_df = build_export_df(final_rows)
+    export_df = build_export_df(markdown_txt, final_rows)
 
     try:
         output_excel, pointout_count = save_to_excel(
